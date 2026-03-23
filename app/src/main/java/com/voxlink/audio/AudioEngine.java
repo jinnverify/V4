@@ -11,6 +11,7 @@ import android.util.Log;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -24,17 +25,17 @@ public class AudioEngine {
     private static final int    CHANNEL_IN  = AudioFormat.CHANNEL_IN_MONO;
     private static final int    CHANNEL_OUT = AudioFormat.CHANNEL_OUT_MONO;
     private static final int    ENCODING    = AudioFormat.ENCODING_PCM_16BIT;
-    private static final int    FRAME_BYTES = 640; // 20ms @ 16kHz PCM16
+    private static final int    FRAME_BYTES = 640; // 20ms @ 16kHz PCM16 mono
     private static final int    HEADER_SIZE = 24;  // 8 room + 8 user + 4 udpKey + 4 seq
+    private static final int    FRAME_MS    = 20;
 
-    // Jitter buffer: hold up to 3 frames per sender before mixing
-    private static final int    JITTER_FRAMES = 3;
-    private static final int    JITTER_TIMEOUT_MS = 60; // max wait before playing what we have
+    // Jitter buffer: larger = more latency but smoother audio
+    private static final int    JITTER_FRAMES     = 6;   // 120ms buffer
+    private static final int    STALE_SENDER_MS   = 5000; // clean sender after 5s silence
 
     private AudioRecord    audioRecord;
     private AudioTrack     audioTrack;
-
-    private DatagramSocket sendSocket;
+    private DatagramSocket udpSocket;
 
     private final AtomicBoolean running  = new AtomicBoolean(false);
     private final AtomicBoolean muted    = new AtomicBoolean(false);
@@ -44,11 +45,11 @@ public class AudioEngine {
     private final int    serverPort;
     private final String userId;
     private final String roomId;
-    private final byte[] udpKeyBytes; // 4-byte auth key
+    private final byte[] udpKeyBytes;
 
     private ExecutorService executor;
+    private InetAddress serverAddr;
 
-    // Per-sender jitter buffers: senderId → ring buffer of PCM frames
     private final ConcurrentHashMap<String, SenderBuffer> senderBuffers = new ConcurrentHashMap<>();
 
     public AudioEngine(String serverHost, int serverPort, String userId, String roomId, byte[] udpKey) {
@@ -61,13 +62,16 @@ public class AudioEngine {
 
     public boolean init() {
         try {
+            // Resolve server address once
+            serverAddr = InetAddress.getByName(serverHost);
+
             int minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_IN, ENCODING);
-            if (minBuf <= 0) { Log.e(TAG, "Bad buffer size"); return false; }
+            if (minBuf <= 0) { Log.e(TAG, "Bad mic buffer size"); return false; }
 
             audioRecord = new AudioRecord(
                 MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                 SAMPLE_RATE, CHANNEL_IN, ENCODING,
-                Math.max(minBuf, FRAME_BYTES * 2));
+                Math.max(minBuf, FRAME_BYTES * 4));
 
             AudioAttributes attrs = new AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
@@ -84,20 +88,26 @@ public class AudioEngine {
             audioTrack = new AudioTrack.Builder()
                 .setAudioAttributes(attrs)
                 .setAudioFormat(fmt)
-                .setBufferSizeInBytes(Math.max(outBuf, FRAME_BYTES * 4))
+                .setBufferSizeInBytes(Math.max(outBuf, FRAME_BYTES * 6))
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build();
 
-            sendSocket = new DatagramSocket();
-            sendSocket.setSoTimeout(500);
-            sendSocket.setReceiveBufferSize(64 * 1024);
-            sendSocket.setSendBufferSize(64 * 1024);
+            udpSocket = new DatagramSocket();
+            udpSocket.setSoTimeout(FRAME_MS); // short timeout = tight recv loop
+            udpSocket.setReceiveBufferSize(128 * 1024);
+            udpSocket.setSendBufferSize(64 * 1024);
 
-            return audioRecord.getState() == AudioRecord.STATE_INITIALIZED
-                && audioTrack.getState()  == AudioTrack.STATE_INITIALIZED;
+            boolean ok = audioRecord.getState() == AudioRecord.STATE_INITIALIZED
+                      && audioTrack.getState()  == AudioTrack.STATE_INITIALIZED;
+
+            Log.d(TAG, "init: mic=" + audioRecord.getState()
+                    + " spk=" + audioTrack.getState()
+                    + " udp=" + udpSocket.getLocalPort()
+                    + " → " + serverHost + ":" + serverPort);
+            return ok;
 
         } catch (Exception e) {
-            Log.e(TAG, "init: " + e.getMessage());
+            Log.e(TAG, "init failed: " + e.getMessage(), e);
             return false;
         }
     }
@@ -107,31 +117,31 @@ public class AudioEngine {
         running.set(true);
         audioRecord.startRecording();
         audioTrack.play();
-        executor = Executors.newFixedThreadPool(3); // send + receive + mixer
+        executor = Executors.newFixedThreadPool(3);
         executor.execute(this::sendLoop);
         executor.execute(this::recvLoop);
         executor.execute(this::mixLoop);
-        Log.d(TAG, "AudioEngine started → " + serverHost + ":" + serverPort
-                + " room=" + roomId + " user=" + userId
-                + " udpKey=" + bytesToHex(udpKeyBytes)
-                + " localPort=" + sendSocket.getLocalPort());
+        Log.d(TAG, "Started: room=" + roomId + " user=" + userId
+                + " key=" + bytesToHex(udpKeyBytes));
     }
+
+    // ── SEND: mic → UDP ─────────────────────────────────────────────────────
 
     private void sendLoop() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
         byte[] pcm = new byte[FRAME_BYTES];
-        byte[] pkt = new byte[FRAME_BYTES + HEADER_SIZE];
-        long   seq = 0;
+        byte[] pkt = new byte[HEADER_SIZE + FRAME_BYTES];
+        long seq = 0;
+
+        // Write static header parts once
         writeHeader(pkt);
 
         try {
-            InetAddress addr = InetAddress.getByName(serverHost);
             while (running.get()) {
-                int read = audioRecord.read(pcm, 0, pcm.length);
-
+                int read = audioRecord.read(pcm, 0, FRAME_BYTES);
                 if (read < 0) {
-                    Log.w(TAG, "AudioRecord.read error: " + read);
-                    Thread.sleep(20);
+                    Log.w(TAG, "mic read error: " + read);
+                    Thread.sleep(FRAME_MS);
                     continue;
                 }
                 if (read == 0) continue;
@@ -141,41 +151,45 @@ public class AudioEngine {
 
                 if (muted.get() || !voice) continue;
 
-                // Sequence number at bytes 20-23 (wraps at 32-bit boundary)
-                int seqInt = (int)(seq & 0xFFFFFFFFL);
-                pkt[20] = (byte)(seqInt >> 24);
-                pkt[21] = (byte)(seqInt >> 16);
-                pkt[22] = (byte)(seqInt >> 8);
-                pkt[23] = (byte) seqInt;
+                // Write sequence number
+                int s = (int)(seq & 0xFFFFFFFFL);
+                pkt[20] = (byte)(s >> 24);
+                pkt[21] = (byte)(s >> 16);
+                pkt[22] = (byte)(s >> 8);
+                pkt[23] = (byte) s;
                 seq++;
 
                 System.arraycopy(pcm, 0, pkt, HEADER_SIZE, read);
 
-                if (sendSocket != null && !sendSocket.isClosed()) {
-                    sendSocket.send(new DatagramPacket(pkt, HEADER_SIZE + read, addr, serverPort));
-                    if (seq % 50 == 1) Log.v(TAG, "sent pkt seq=" + (seq-1) + " to " + serverHost + ":" + serverPort);
+                if (udpSocket != null && !udpSocket.isClosed()) {
+                    udpSocket.send(new DatagramPacket(pkt, HEADER_SIZE + read, serverAddr, serverPort));
                 }
             }
         } catch (Exception e) {
-            if (running.get()) Log.e(TAG, "sendLoop: " + e.getMessage(), e);
+            if (running.get()) Log.e(TAG, "sendLoop crash: " + e.getMessage(), e);
         }
+        Log.d(TAG, "sendLoop ended");
     }
+
+    // ── RECV: UDP → jitter buffers ──────────────────────────────────────────
 
     private void recvLoop() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
-        byte[]         buf = new byte[2048]; // larger buffer to avoid truncation
+        byte[] buf = new byte[2048];
         DatagramPacket pkt = new DatagramPacket(buf, buf.length);
+        long recvCount = 0;
 
         while (running.get()) {
             try {
-                if (sendSocket == null || sendSocket.isClosed()) break;
-                pkt.setLength(buf.length); // reset length before each receive
-                sendSocket.receive(pkt);
+                if (udpSocket == null || udpSocket.isClosed()) break;
+                pkt.setLength(buf.length);
+                udpSocket.receive(pkt);
+
                 int len = pkt.getLength();
                 if (len <= HEADER_SIZE) continue;
 
-                // Extract sender ID from header bytes 8-15
-                String senderId = new String(buf, 8, 8, java.nio.charset.StandardCharsets.UTF_8)
+                // Extract sender short ID from header bytes 8-15
+                String senderId = new String(buf, 8, 8, StandardCharsets.UTF_8)
                         .replace("\0", "").trim();
                 if (senderId.isEmpty() || senderId.equals(userId)) continue;
 
@@ -183,34 +197,39 @@ public class AudioEngine {
                 byte[] frame = new byte[dataLen];
                 System.arraycopy(buf, HEADER_SIZE, frame, 0, dataLen);
 
-                // Put into sender's jitter buffer
                 SenderBuffer sb = senderBuffers.computeIfAbsent(senderId, k -> new SenderBuffer());
                 sb.addFrame(frame);
-                Log.v(TAG, "recv frame from " + senderId + " len=" + dataLen);
+                recvCount++;
+
+                if (recvCount % 100 == 1) {
+                    Log.d(TAG, "recv #" + recvCount + " from=" + senderId + " len=" + dataLen
+                            + " senders=" + senderBuffers.size());
+                }
 
             } catch (java.net.SocketTimeoutException ignored) {
-                // normal silence window — no data from server in timeout period
+                // Expected — no data in this FRAME_MS window
             } catch (Exception e) {
                 if (running.get()) Log.w(TAG, "recvLoop: " + e.getMessage());
             }
         }
+        Log.d(TAG, "recvLoop ended, total=" + recvCount);
     }
 
-    /**
-     * Mixer thread: every 20ms, collect one frame from each sender buffer,
-     * mix them (sum + clip to int16 range), write to AudioTrack.
-     */
+    // ── MIXER: jitter buffers → speaker ─────────────────────────────────────
+
     private void mixLoop() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
         byte[] mixBuf = new byte[FRAME_BYTES];
-        int samplesPerFrame = FRAME_BYTES / 2; // 16-bit samples
+        byte[] silence = new byte[FRAME_BYTES];
+        int samplesPerFrame = FRAME_BYTES / 2;
+        long lastCleanup = System.currentTimeMillis();
 
         while (running.get()) {
+            long frameStart = System.nanoTime();
             try {
                 boolean hasAudio = false;
                 int[] mixed = new int[samplesPerFrame];
 
-                // Collect one frame from each sender and mix
                 for (Map.Entry<String, SenderBuffer> entry : senderBuffers.entrySet()) {
                     byte[] frame = entry.getValue().pollFrame();
                     if (frame == null) continue;
@@ -218,17 +237,12 @@ public class AudioEngine {
 
                     int samples = Math.min(frame.length / 2, samplesPerFrame);
                     for (int i = 0; i < samples; i++) {
-                        short s = (short)((frame[i * 2 + 1] << 8) | (frame[i * 2] & 0xFF));
-                        mixed[i] += s;
+                        short sv = (short)((frame[i * 2 + 1] << 8) | (frame[i * 2] & 0xFF));
+                        mixed[i] += sv;
                     }
                 }
 
-                // Clean up stale senders (no data for >2s)
-                long now = System.currentTimeMillis();
-                senderBuffers.entrySet().removeIf(e -> now - e.getValue().lastFrameTime > 2000);
-
                 if (hasAudio) {
-                    // Clip to int16 range and write
                     for (int i = 0; i < samplesPerFrame; i++) {
                         int v = Math.max(-32768, Math.min(32767, mixed[i]));
                         mixBuf[i * 2]     = (byte)(v & 0xFF);
@@ -236,42 +250,53 @@ public class AudioEngine {
                     }
                     audioTrack.write(mixBuf, 0, FRAME_BYTES);
                 } else {
-                    // No audio from anyone — sleep for one frame period
-                    Thread.sleep(20);
+                    // Write silence to keep AudioTrack alive and prevent underrun
+                    audioTrack.write(silence, 0, FRAME_BYTES);
                 }
+
+                // Clean stale senders periodically (every 1s)
+                long now = System.currentTimeMillis();
+                if (now - lastCleanup > 1000) {
+                    lastCleanup = now;
+                    senderBuffers.entrySet().removeIf(
+                            e -> now - e.getValue().lastFrameTime > STALE_SENDER_MS);
+                }
+
+                // Pace to ~20ms per frame
+                long elapsed = (System.nanoTime() - frameStart) / 1_000_000;
+                long sleepMs = FRAME_MS - elapsed;
+                if (sleepMs > 1) Thread.sleep(sleepMs);
+
             } catch (Exception e) {
                 if (running.get()) Log.w(TAG, "mixLoop: " + e.getMessage());
             }
         }
+        Log.d(TAG, "mixLoop ended");
     }
 
-    /** Energy-based Voice Activity Detection — skip sending silence */
+    // ── VAD ─────────────────────────────────────────────────────────────────
+
     private boolean isVoiceActive(byte[] buf, int len) {
         long sum = 0;
+        int samples = len / 2;
         for (int i = 0; i + 1 < len; i += 2) {
             short s = (short)((buf[i + 1] << 8) | (buf[i] & 0xFF));
             sum += Math.abs(s);
         }
-        return (sum / (len / 2)) > 300;
+        return samples > 0 && (sum / samples) > 300;
     }
 
-    /**
-     * Header: 8B roomId + 8B userId + 4B udpKey + 4B seq = 24 bytes
-     */
+    // ── Header ──────────────────────────────────────────────────────────────
+
     private void writeHeader(byte[] pkt) {
-        byte[] rb = roomId.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        byte[] ub = userId.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] rb = roomId.getBytes(StandardCharsets.UTF_8);
+        byte[] ub = userId.getBytes(StandardCharsets.UTF_8);
         for (int i = 0; i < 8; i++) pkt[i]     = (i < rb.length) ? rb[i] : 0;
         for (int i = 0; i < 8; i++) pkt[8 + i] = (i < ub.length) ? ub[i] : 0;
-        // UDP auth key at bytes 16-19
         System.arraycopy(udpKeyBytes, 0, pkt, 16, 4);
     }
 
-    private static String bytesToHex(byte[] b) {
-        StringBuilder sb = new StringBuilder();
-        for (byte v : b) sb.append(String.format("%02x", v & 0xFF));
-        return sb.toString();
-    }
+    // ── Public API ──────────────────────────────────────────────────────────
 
     public void setMuted(boolean m) { muted.set(m); }
     public boolean isMuted()        { return muted.get(); }
@@ -280,17 +305,25 @@ public class AudioEngine {
     public void stop() {
         running.set(false);
         senderBuffers.clear();
-        try { if (audioRecord != null) { audioRecord.stop(); audioRecord.release(); audioRecord = null; } } catch (Exception ignored) {}
-        try { if (audioTrack  != null) { audioTrack.stop();  audioTrack.release();  audioTrack  = null; } } catch (Exception ignored) {}
-        try { if (sendSocket  != null && !sendSocket.isClosed()) { sendSocket.close(); } sendSocket = null; } catch (Exception ignored) {}
+        try { if (audioRecord != null) { audioRecord.stop(); audioRecord.release(); } } catch (Exception ignored) {}
+        try { if (audioTrack  != null) { audioTrack.stop();  audioTrack.release();  } } catch (Exception ignored) {}
+        try { if (udpSocket   != null && !udpSocket.isClosed()) udpSocket.close(); } catch (Exception ignored) {}
         if (executor != null) executor.shutdownNow();
+        audioRecord = null;
+        audioTrack  = null;
+        udpSocket   = null;
+        executor    = null;
         Log.d(TAG, "AudioEngine stopped");
     }
 
-    /**
-     * Per-sender ring buffer that holds up to JITTER_FRAMES PCM frames.
-     * The mixer thread polls one frame at a time.
-     */
+    private static String bytesToHex(byte[] b) {
+        StringBuilder sb = new StringBuilder();
+        for (byte v : b) sb.append(String.format("%02x", v & 0xFF));
+        return sb.toString();
+    }
+
+    // ── Jitter Buffer ───────────────────────────────────────────────────────
+
     static class SenderBuffer {
         private final byte[][] frames = new byte[JITTER_FRAMES][];
         private int writePos = 0;
@@ -304,7 +337,6 @@ public class AudioEngine {
             if (count < JITTER_FRAMES) {
                 count++;
             } else {
-                // Buffer full — drop oldest
                 readPos = (readPos + 1) % JITTER_FRAMES;
             }
             lastFrameTime = System.currentTimeMillis();

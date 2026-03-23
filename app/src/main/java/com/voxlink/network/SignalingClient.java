@@ -33,7 +33,7 @@ public class SignalingClient {
 
     private static final String TAG = "VoxLink.Signal";
     private static final int POLL_INTERVAL_MS  = 3000;
-    private static final int HEARTBEAT_SECS    = 10;
+    private static final int HEARTBEAT_SECS    = 8;
     private static final int TIMEOUT_MS        = 8000;
 
     private final String baseUrl;   // e.g. "https://myserver.railway.app"
@@ -104,11 +104,14 @@ public class SignalingClient {
 
     /** Join a room. Server returns udp_host + udp_port dynamically. */
     public void join(String roomId, String password, String userName) {
+        // Stop any previous polling/heartbeat (reconnect case)
+        if (scheduler != null) { scheduler.shutdownNow(); scheduler = null; }
+        connected.set(false);
+
         this.roomId = roomId;
         this.userId = userName + "_" + (System.currentTimeMillis() % 9999);
         this.resolvedUserId = this.userId;
 
-        // Recreate executor if previous one was shut down (e.g. after leave())
         if (ioExecutor == null || ioExecutor.isShutdown()) {
             ioExecutor = Executors.newSingleThreadExecutor();
         }

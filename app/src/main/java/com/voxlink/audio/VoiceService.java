@@ -185,8 +185,13 @@ public class VoiceService extends Service {
                 .apply();
         }
 
-        // Stop existing engine if re-starting
-        if (audioEngine != null) { audioEngine.stop(); audioEngine = null; }
+        // Stop existing engine fully before re-creating (reconnect case)
+        if (audioEngine != null) {
+            audioEngine.stop();
+            audioEngine = null;
+            // Small delay to let OS release audio resources
+            try { Thread.sleep(100); } catch (InterruptedException ignored) {}
+        }
 
         // Parse UDP auth key from hex string
         byte[] udpKeyBytes = hexToBytes(udpKey);
@@ -264,7 +269,7 @@ public class VoiceService extends Service {
             } catch (Exception e) {
                 Log.w(TAG, "Service heartbeat: " + e.getMessage());
             }
-        }, 10, 10, TimeUnit.SECONDS);
+        }, 5, 8, TimeUnit.SECONDS);
     }
 
     private void stopVoice() {
