@@ -61,11 +61,6 @@ public class WebRTCEngine {
         PeerConnectionFactory.Options options = new PeerConnectionFactory.Options();
         factory = PeerConnectionFactory.builder()
                 .setOptions(options)
-                .setAudioDeviceModule(
-                        org.webrtc.JavaAudioDeviceModule.builder(context)
-                                .setUseHardwareAcousticEchoCanceler(true)
-                                .setUseHardwareNoiseSuppressor(true)
-                                .createAudioDeviceModule())
                 .createPeerConnectionFactory();
 
         MediaConstraints audioConstraints = new MediaConstraints();
