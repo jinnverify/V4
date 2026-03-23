@@ -22,33 +22,25 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import com.voxlink.model.Room;
 
-/**
- * Signaling client — server URL is NOT hardcoded.
- * It comes from the deep link: voxlink://join?s=HOST&r=ROOM&p=PASS
- *
- * The server also returns udp_host + udp_port in the /join response,
- * so AudioEngine gets the right UDP address dynamically too.
- */
 public class SignalingClient {
 
     private static final String TAG = "VoxLink.Signal";
     private static final int POLL_INTERVAL_MS  = 3000;
-    private static final int HEARTBEAT_SECS    = 8;
     private static final int TIMEOUT_MS        = 8000;
 
-    private final String baseUrl;   // e.g. "https://myserver.railway.app"
+    private final String baseUrl;
     private String userId;
     private String roomId;
     private String token;
     private String udpHost;
-    private String udpKey;    // 4-byte hex auth key for UDP packets
-    private String udpRoomId; // 8-char short room ID for UDP header (from server)
-    private String udpUserId; // 8-char short user ID for UDP header (from server)
+    private String udpKey;
+    private String udpRoomId;
+    private String udpUserId;
     private int    udpPort = 45000;
-    private String resolvedUserId; // the actual userId used for join, shared with VoiceService
+    private String resolvedUserId;
 
-    private ScheduledExecutorService scheduler;
-    private volatile java.util.concurrent.ExecutorService ioExecutor = Executors.newSingleThreadExecutor();
+    private volatile ScheduledExecutorService scheduler;
+    private volatile java.util.concurrent.ExecutorService ioExecutor;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final AtomicBoolean connected = new AtomicBoolean(false);
 
@@ -63,16 +55,10 @@ public class SignalingClient {
         void onDisconnected();
     }
 
-    /**
-     * @param serverHost  The host from the deep link ?s= param.
-     *                    May be "host.com", "host.com:3000", or "https://host.com"
-     */
     public SignalingClient(String serverHost) {
-        // Normalise to a proper base URL
         if (serverHost.startsWith("http://") || serverHost.startsWith("https://")) {
             this.baseUrl = serverHost.replaceAll("/$", "");
         } else {
-            // Assume HTTPS for production; HTTP for localhost/private IP
             boolean isLocal = serverHost.startsWith("192.168.")
                            || serverHost.startsWith("10.")
                            || serverHost.matches("^172\\.(1[6-9]|2[0-9]|3[01])\\..+")
@@ -89,24 +75,24 @@ public class SignalingClient {
 
     public String getUdpHost()        { return udpHost; }
     public String getUdpKey()         { return udpKey; }
-    public String getUdpRoomId()     { return udpRoomId; }
-    public String getUdpUserId()     { return udpUserId; }
+    public String getUdpRoomId()      { return udpRoomId; }
+    public String getUdpUserId()      { return udpUserId; }
     public int    getUdpPort()        { return udpPort; }
     public String getResolvedUserId() { return resolvedUserId; }
     public String getToken()          { return token; }
     public String getBaseUrl()        { return baseUrl; }
 
-    /** Stop polling/heartbeat without sending leave to server */
+    /** Stop polling without sending leave */
     public void stopPolling() {
         connected.set(false);
-        if (scheduler != null) { scheduler.shutdownNow(); scheduler = null; }
+        ScheduledExecutorService s = scheduler;
+        if (s != null) { s.shutdownNow(); scheduler = null; }
     }
 
-    /** Join a room. Server returns udp_host + udp_port dynamically. */
+    /** Join a room */
     public void join(String roomId, String password, String userName) {
-        // Stop any previous polling/heartbeat (reconnect case)
-        if (scheduler != null) { scheduler.shutdownNow(); scheduler = null; }
-        connected.set(false);
+        // Clean up any previous session
+        stopPolling();
 
         this.roomId = roomId;
         this.userId = userName + "_" + (System.currentTimeMillis() % 9999);
@@ -137,6 +123,10 @@ public class SignalingClient {
                     Room room = parseRoom(resp);
                     connected.set(true);
 
+                    Log.d(TAG, "Joined: room=" + roomId + " udpHost=" + udpHost
+                            + ":" + udpPort + " udpRoom=" + udpRoomId
+                            + " udpUser=" + udpUserId);
+
                     final String uid = resolvedUserId;
                     final String key = udpKey;
                     final String uRid = udpRoomId;
@@ -146,7 +136,6 @@ public class SignalingClient {
                     });
 
                     startPolling();
-                    startHeartbeat();
                 } else {
                     String err = resp != null ? resp.optString("error", "Join failed") : "Server unreachable";
                     mainHandler.post(() -> {
@@ -156,7 +145,7 @@ public class SignalingClient {
             } catch (Exception e) {
                 Log.e(TAG, "Join error: " + e.getMessage());
                 mainHandler.post(() -> {
-                    if (listener != null) listener.onError("Connection failed");
+                    if (listener != null) listener.onError("Connection failed: " + e.getMessage());
                 });
             }
         });
@@ -164,7 +153,8 @@ public class SignalingClient {
 
     public void leave() {
         connected.set(false);
-        if (scheduler != null) { scheduler.shutdownNow(); scheduler = null; }
+        ScheduledExecutorService s = scheduler;
+        if (s != null) { s.shutdownNow(); scheduler = null; }
 
         final java.util.concurrent.ExecutorService exec = ioExecutor;
         if (exec == null || exec.isShutdown()) return;
@@ -181,16 +171,18 @@ public class SignalingClient {
         });
     }
 
+    // Polling only — no separate heartbeat (VoiceService handles heartbeat)
     private void startPolling() {
-        scheduler = Executors.newScheduledThreadPool(2); // 2 threads: poll + heartbeat
+        scheduler = Executors.newSingleThreadScheduledExecutor();
         scheduler.scheduleWithFixedDelay(() -> {
             if (!connected.get()) return;
             try {
                 JSONObject resp = getJson("/poll?room_id=" + java.net.URLEncoder.encode(roomId, "UTF-8")
                         + "&user_id=" + java.net.URLEncoder.encode(userId, "UTF-8")
-                        + "&token=" + token); // token is hex, no encoding needed
+                        + "&token=" + token);
                 if (resp == null) return;
                 if (resp.optBoolean("disbanded", false)) {
+                    connected.set(false);
                     mainHandler.post(() -> { if (listener != null) listener.onDisconnected(); });
                     return;
                 }
@@ -204,19 +196,6 @@ public class SignalingClient {
         }, POLL_INTERVAL_MS, POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
 
-    private void startHeartbeat() {
-        scheduler.scheduleWithFixedDelay(() -> {
-            if (!connected.get()) return;
-            try {
-                JSONObject body = new JSONObject();
-                body.put("room_id", roomId);
-                body.put("user_id", userId);
-                body.put("token",   token);
-                postJson("/ping", body);
-            } catch (Exception ignored) {}
-        }, HEARTBEAT_SECS, HEARTBEAT_SECS, TimeUnit.SECONDS);
-    }
-
     // ── HTTP helpers ───────────────────────────────────────────────────────────
 
     private JSONObject postJson(String path, JSONObject body) throws Exception {
@@ -227,9 +206,10 @@ public class SignalingClient {
             c.setFixedLengthStreamingMode(data.length);
             try (OutputStream os = c.getOutputStream()) { os.write(data); }
             if (c.getResponseCode() == 200) return new JSONObject(read(c));
+            Log.w(TAG, path + " returned " + c.getResponseCode());
             return null;
         } finally {
-            c.disconnect(); // FIX B5: always release connection
+            c.disconnect();
         }
     }
 
@@ -239,7 +219,7 @@ public class SignalingClient {
             if (c.getResponseCode() == 200) return new JSONObject(read(c));
             return null;
         } finally {
-            c.disconnect(); // FIX B5: always release connection
+            c.disconnect();
         }
     }
 
@@ -283,7 +263,6 @@ public class SignalingClient {
         return list;
     }
 
-    /** Build a shareable web link (browser opens → redirects to app) */
     public static String buildShareUrl(String serverHost, String roomId, String password) {
         String base = serverHost.startsWith("http") ? serverHost : "https://" + serverHost;
         try {

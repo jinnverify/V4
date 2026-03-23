@@ -130,6 +130,7 @@ public class MainActivity extends AppCompatActivity {
         i.putExtra(RoomActivity.EXTRA_PASSWORD, password);
         i.putExtra(RoomActivity.EXTRA_USERNAME, username);
         startActivity(i);
+        finish(); // Remove MainActivity from back stack so user returns to home, not input screen
     }
 
     // Deep link: voxlink://join?s=HOST&r=ROOM&p=PASS

@@ -227,6 +227,10 @@ public class RoomActivity extends AppCompatActivity {
             unbindService(serviceConn);
             serviceBound = false;
         }
+        // Go back to MainActivity so user can join another room
+        Intent main = new Intent(this, MainActivity.class);
+        main.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+        startActivity(main);
         finish();
     }
 

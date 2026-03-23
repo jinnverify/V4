@@ -16,6 +16,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class AudioEngine {
@@ -29,13 +30,15 @@ public class AudioEngine {
     private static final int    HEADER_SIZE = 24;  // 8 room + 8 user + 4 udpKey + 4 seq
     private static final int    FRAME_MS    = 20;
 
-    // Jitter buffer: larger = more latency but smoother audio
-    private static final int    JITTER_FRAMES     = 6;   // 120ms buffer
-    private static final int    STALE_SENDER_MS   = 5000; // clean sender after 5s silence
+    private static final int    JITTER_FRAMES   = 8;    // 160ms jitter buffer
+    private static final int    STALE_SENDER_MS = 5000;
+    private static final int    VAD_THRESHOLD   = 250;
+    // Hold voice active for extra frames after energy drops — prevents clipping words
+    private static final int    VAD_HOLD_FRAMES = 15;    // 300ms hangover
 
-    private AudioRecord    audioRecord;
-    private AudioTrack     audioTrack;
-    private DatagramSocket udpSocket;
+    private volatile AudioRecord    audioRecord;
+    private volatile AudioTrack     audioTrack;
+    private volatile DatagramSocket udpSocket;
 
     private final AtomicBoolean running  = new AtomicBoolean(false);
     private final AtomicBoolean muted    = new AtomicBoolean(false);
@@ -62,7 +65,6 @@ public class AudioEngine {
 
     public boolean init() {
         try {
-            // Resolve server address once
             serverAddr = InetAddress.getByName(serverHost);
 
             int minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_IN, ENCODING);
@@ -88,12 +90,12 @@ public class AudioEngine {
             audioTrack = new AudioTrack.Builder()
                 .setAudioAttributes(attrs)
                 .setAudioFormat(fmt)
-                .setBufferSizeInBytes(Math.max(outBuf, FRAME_BYTES * 6))
+                .setBufferSizeInBytes(Math.max(outBuf, FRAME_BYTES * 8))
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build();
 
             udpSocket = new DatagramSocket();
-            udpSocket.setSoTimeout(FRAME_MS); // short timeout = tight recv loop
+            udpSocket.setSoTimeout(50);
             udpSocket.setReceiveBufferSize(128 * 1024);
             udpSocket.setSendBufferSize(64 * 1024);
 
@@ -102,8 +104,9 @@ public class AudioEngine {
 
             Log.d(TAG, "init: mic=" + audioRecord.getState()
                     + " spk=" + audioTrack.getState()
-                    + " udp=" + udpSocket.getLocalPort()
-                    + " → " + serverHost + ":" + serverPort);
+                    + " localPort=" + udpSocket.getLocalPort()
+                    + " → " + serverHost + ":" + serverPort
+                    + " room=" + roomId + " user=" + userId);
             return ok;
 
         } catch (Exception e) {
@@ -132,13 +135,15 @@ public class AudioEngine {
         byte[] pcm = new byte[FRAME_BYTES];
         byte[] pkt = new byte[HEADER_SIZE + FRAME_BYTES];
         long seq = 0;
-
-        // Write static header parts once
+        int vadHold = 0;
         writeHeader(pkt);
 
         try {
             while (running.get()) {
-                int read = audioRecord.read(pcm, 0, FRAME_BYTES);
+                AudioRecord rec = audioRecord;
+                if (rec == null) break;
+
+                int read = rec.read(pcm, 0, FRAME_BYTES);
                 if (read < 0) {
                     Log.w(TAG, "mic read error: " + read);
                     Thread.sleep(FRAME_MS);
@@ -146,12 +151,17 @@ public class AudioEngine {
                 }
                 if (read == 0) continue;
 
-                boolean voice = isVoiceActive(pcm, read);
+                boolean energyActive = isVoiceActive(pcm, read);
+                if (energyActive) {
+                    vadHold = VAD_HOLD_FRAMES;
+                } else if (vadHold > 0) {
+                    vadHold--;
+                }
+                boolean voice = vadHold > 0;
                 speaking.set(voice);
 
                 if (muted.get() || !voice) continue;
 
-                // Write sequence number
                 int s = (int)(seq & 0xFFFFFFFFL);
                 pkt[20] = (byte)(s >> 24);
                 pkt[21] = (byte)(s >> 16);
@@ -161,14 +171,15 @@ public class AudioEngine {
 
                 System.arraycopy(pcm, 0, pkt, HEADER_SIZE, read);
 
-                if (udpSocket != null && !udpSocket.isClosed()) {
-                    udpSocket.send(new DatagramPacket(pkt, HEADER_SIZE + read, serverAddr, serverPort));
+                DatagramSocket sock = udpSocket;
+                if (sock != null && !sock.isClosed()) {
+                    sock.send(new DatagramPacket(pkt, HEADER_SIZE + read, serverAddr, serverPort));
                 }
             }
         } catch (Exception e) {
             if (running.get()) Log.e(TAG, "sendLoop crash: " + e.getMessage(), e);
         }
-        Log.d(TAG, "sendLoop ended");
+        Log.d(TAG, "sendLoop ended, seq=" + seq);
     }
 
     // ── RECV: UDP → jitter buffers ──────────────────────────────────────────
@@ -181,14 +192,14 @@ public class AudioEngine {
 
         while (running.get()) {
             try {
-                if (udpSocket == null || udpSocket.isClosed()) break;
+                DatagramSocket sock = udpSocket;
+                if (sock == null || sock.isClosed()) break;
                 pkt.setLength(buf.length);
-                udpSocket.receive(pkt);
+                sock.receive(pkt);
 
                 int len = pkt.getLength();
                 if (len <= HEADER_SIZE) continue;
 
-                // Extract sender short ID from header bytes 8-15
                 String senderId = new String(buf, 8, 8, StandardCharsets.UTF_8)
                         .replace("\0", "").trim();
                 if (senderId.isEmpty() || senderId.equals(userId)) continue;
@@ -201,13 +212,12 @@ public class AudioEngine {
                 sb.addFrame(frame);
                 recvCount++;
 
-                if (recvCount % 100 == 1) {
-                    Log.d(TAG, "recv #" + recvCount + " from=" + senderId + " len=" + dataLen
+                if (recvCount % 500 == 1) {
+                    Log.d(TAG, "recv #" + recvCount + " from=" + senderId
                             + " senders=" + senderBuffers.size());
                 }
 
             } catch (java.net.SocketTimeoutException ignored) {
-                // Expected — no data in this FRAME_MS window
             } catch (Exception e) {
                 if (running.get()) Log.w(TAG, "recvLoop: " + e.getMessage());
             }
@@ -216,17 +226,21 @@ public class AudioEngine {
     }
 
     // ── MIXER: jitter buffers → speaker ─────────────────────────────────────
+    // audioTrack.write() in STREAM mode blocks for ~20ms (one frame duration).
+    // This provides natural real-time pacing — no extra sleep needed.
 
     private void mixLoop() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
-        byte[] mixBuf = new byte[FRAME_BYTES];
+        byte[] mixBuf  = new byte[FRAME_BYTES];
         byte[] silence = new byte[FRAME_BYTES];
         int samplesPerFrame = FRAME_BYTES / 2;
         long lastCleanup = System.currentTimeMillis();
 
         while (running.get()) {
-            long frameStart = System.nanoTime();
             try {
+                AudioTrack track = audioTrack;
+                if (track == null) break;
+
                 boolean hasAudio = false;
                 int[] mixed = new int[samplesPerFrame];
 
@@ -248,24 +262,19 @@ public class AudioEngine {
                         mixBuf[i * 2]     = (byte)(v & 0xFF);
                         mixBuf[i * 2 + 1] = (byte)((v >> 8) & 0xFF);
                     }
-                    audioTrack.write(mixBuf, 0, FRAME_BYTES);
+                    track.write(mixBuf, 0, FRAME_BYTES);
                 } else {
-                    // Write silence to keep AudioTrack alive and prevent underrun
-                    audioTrack.write(silence, 0, FRAME_BYTES);
+                    // Silence keeps AudioTrack clock running; blocking write provides pacing
+                    track.write(silence, 0, FRAME_BYTES);
                 }
 
-                // Clean stale senders periodically (every 1s)
+                // Periodic stale sender cleanup
                 long now = System.currentTimeMillis();
-                if (now - lastCleanup > 1000) {
+                if (now - lastCleanup > 2000) {
                     lastCleanup = now;
                     senderBuffers.entrySet().removeIf(
                             e -> now - e.getValue().lastFrameTime > STALE_SENDER_MS);
                 }
-
-                // Pace to ~20ms per frame
-                long elapsed = (System.nanoTime() - frameStart) / 1_000_000;
-                long sleepMs = FRAME_MS - elapsed;
-                if (sleepMs > 1) Thread.sleep(sleepMs);
 
             } catch (Exception e) {
                 if (running.get()) Log.w(TAG, "mixLoop: " + e.getMessage());
@@ -283,7 +292,7 @@ public class AudioEngine {
             short s = (short)((buf[i + 1] << 8) | (buf[i] & 0xFF));
             sum += Math.abs(s);
         }
-        return samples > 0 && (sum / samples) > 300;
+        return samples > 0 && (sum / samples) > VAD_THRESHOLD;
     }
 
     // ── Header ──────────────────────────────────────────────────────────────
@@ -304,11 +313,21 @@ public class AudioEngine {
 
     public void stop() {
         running.set(false);
-        senderBuffers.clear();
+
+        // Close socket first to unblock recvLoop
+        try { if (udpSocket != null && !udpSocket.isClosed()) udpSocket.close(); } catch (Exception ignored) {}
+
+        // Shutdown executor and wait briefly for threads to finish
+        if (executor != null) {
+            executor.shutdownNow();
+            try { executor.awaitTermination(500, TimeUnit.MILLISECONDS); } catch (InterruptedException ignored) {}
+        }
+
+        // Now safe to release audio resources
         try { if (audioRecord != null) { audioRecord.stop(); audioRecord.release(); } } catch (Exception ignored) {}
         try { if (audioTrack  != null) { audioTrack.stop();  audioTrack.release();  } } catch (Exception ignored) {}
-        try { if (udpSocket   != null && !udpSocket.isClosed()) udpSocket.close(); } catch (Exception ignored) {}
-        if (executor != null) executor.shutdownNow();
+
+        senderBuffers.clear();
         audioRecord = null;
         audioTrack  = null;
         udpSocket   = null;

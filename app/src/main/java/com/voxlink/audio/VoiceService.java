@@ -33,6 +33,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import com.voxlink.ui.RoomActivity;
 
@@ -61,8 +62,11 @@ public class VoiceService extends Service {
     private PowerManager.WakeLock      wakeLock;
     private WifiManager.WifiLock       wifiLock;
     private ScheduledExecutorService   heartbeatScheduler;
-    private boolean                    isMuted     = false;
+    private volatile boolean           isMuted     = false;
     private String                     currentRoom = "";
+
+    // Track consecutive heartbeat failures for connection monitoring
+    private final AtomicInteger heartbeatFailCount = new AtomicInteger(0);
 
     // Floating overlay dot
     private WindowManager              windowManager;
@@ -89,7 +93,6 @@ public class VoiceService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent == null) {
-            // System restarted us (START_STICKY) — restore from SharedPreferences
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
             String roomId     = prefs.getString("room_id", null);
             String serverHost = prefs.getString("server_host", null);
@@ -147,7 +150,7 @@ public class VoiceService extends Service {
                             String baseUrl, String token) {
         if (roomId == null || serverHost == null) { stopSelf(); return; }
 
-        // Persist to SharedPreferences for START_STICKY restart
+        // Persist for START_STICKY restart
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
             .putString("room_id",      roomId)
             .putString("user_id",      userId)
@@ -166,36 +169,35 @@ public class VoiceService extends Service {
         // Foreground notification FIRST
         startForeground(NOTIFICATION_ID, buildNotification(roomId, false));
 
-        // CPU wake lock — keeps CPU alive when screen off
+        // CPU wake lock
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "VoxLink::Voice");
-        wakeLock.acquire(6 * 60 * 60 * 1000L); // 6 hours max
+        if (wakeLock == null) {
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "VoxLink::Voice");
+        }
+        if (!wakeLock.isHeld()) wakeLock.acquire(6 * 60 * 60 * 1000L);
 
-        // WiFi lock — prevents WiFi from sleeping, keeps UDP alive
+        // WiFi lock
         WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "VoxLink::WiFi");
-        wifiLock.acquire();
+        if (wifiLock == null) {
+            wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "VoxLink::WiFi");
+        }
+        if (!wifiLock.isHeld()) wifiLock.acquire();
 
         // Use the same userId from SignalingClient
         if (userId == null || userId.isEmpty()) {
             userId = userName + "_" + (System.currentTimeMillis() % 9999);
-            // Persist the generated userId so START_STICKY restarts use the same identity
             getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                 .putString("user_id", userId)
                 .apply();
         }
 
-        // Stop existing engine fully before re-creating (reconnect case)
+        // Stop existing engine before re-creating
         if (audioEngine != null) {
             audioEngine.stop();
             audioEngine = null;
-            // Small delay to let OS release audio resources
-            try { Thread.sleep(100); } catch (InterruptedException ignored) {}
         }
 
-        // Parse UDP auth key from hex string
         byte[] udpKeyBytes = hexToBytes(udpKey);
-        // Use short 8-char IDs for UDP header to avoid truncation
         audioEngine = new AudioEngine(serverHost, serverPort,
                 udpUserId != null && !udpUserId.isEmpty() ? udpUserId : userId,
                 udpRoomId != null && !udpRoomId.isEmpty() ? udpRoomId : roomId,
@@ -210,13 +212,11 @@ public class VoiceService extends Service {
         }
         audioEngine.start();
 
-        // Start our own heartbeat to server — independent of Activity lifecycle
         startServiceHeartbeat(baseUrl, roomId, userId, token);
-
-        // Floating overlay dot
         showOverlayDot();
 
-        Log.d(TAG, "Voice started for room " + roomId);
+        Log.d(TAG, "Voice started for room " + roomId
+                + " udpRoom=" + udpRoomId + " udpUser=" + udpUserId);
     }
 
     private static byte[] hexToBytes(String hex) {
@@ -236,15 +236,11 @@ public class VoiceService extends Service {
         }
     }
 
-    /**
-     * Heartbeat runs inside the Service — even if Activity is killed,
-     * the server will see this user as alive and won't remove them.
-     * Now also sends muted state so other users see the correct icon.
-     */
     private void startServiceHeartbeat(String baseUrl, String roomId, String userId, String token) {
         if (heartbeatScheduler != null) heartbeatScheduler.shutdownNow();
         if (baseUrl == null || token == null) return;
 
+        heartbeatFailCount.set(0);
         heartbeatScheduler = Executors.newSingleThreadScheduledExecutor();
         heartbeatScheduler.scheduleWithFixedDelay(() -> {
             try {
@@ -264,17 +260,24 @@ public class VoiceService extends Service {
                 byte[] data = body.toString().getBytes(StandardCharsets.UTF_8);
                 c.setFixedLengthStreamingMode(data.length);
                 try (OutputStream os = c.getOutputStream()) { os.write(data); }
-                c.getResponseCode(); // read response to complete request
+                int code = c.getResponseCode();
                 c.disconnect();
+
+                if (code == 200) {
+                    heartbeatFailCount.set(0);
+                } else {
+                    Log.w(TAG, "Heartbeat server returned " + code);
+                    heartbeatFailCount.incrementAndGet();
+                }
             } catch (Exception e) {
-                Log.w(TAG, "Service heartbeat: " + e.getMessage());
+                int fails = heartbeatFailCount.incrementAndGet();
+                Log.w(TAG, "Heartbeat fail #" + fails + ": " + e.getMessage());
             }
-        }, 5, 8, TimeUnit.SECONDS);
+        }, 3, 8, TimeUnit.SECONDS);
     }
 
     private void stopVoice() {
         releaseAll();
-        // Clear persisted state
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().clear().apply();
         stopForeground(true);
         stopSelf();
@@ -284,8 +287,10 @@ public class VoiceService extends Service {
         removeOverlayDot();
         if (audioEngine != null) { audioEngine.stop(); audioEngine = null; }
         if (heartbeatScheduler != null) { heartbeatScheduler.shutdownNow(); heartbeatScheduler = null; }
-        if (wakeLock != null && wakeLock.isHeld()) { wakeLock.release(); wakeLock = null; }
-        if (wifiLock != null && wifiLock.isHeld()) { wifiLock.release(); wifiLock = null; }
+        if (wakeLock != null && wakeLock.isHeld()) { try { wakeLock.release(); } catch (Exception ignored) {} }
+        if (wifiLock != null && wifiLock.isHeld()) { try { wifiLock.release(); } catch (Exception ignored) {} }
+        wakeLock = null;
+        wifiLock = null;
     }
 
     private void toggleMute() {
@@ -304,6 +309,7 @@ public class VoiceService extends Service {
 
     public boolean isMuted() { return isMuted; }
     public AudioEngine getAudioEngine() { return audioEngine; }
+    public boolean isConnected() { return heartbeatFailCount.get() < 5; }
 
     private Notification buildNotification(String roomId, boolean muted) {
         Intent ri = new Intent(this, RoomActivity.class);
@@ -355,7 +361,7 @@ public class VoiceService extends Service {
 
         dotDrawable = new GradientDrawable();
         dotDrawable.setShape(GradientDrawable.OVAL);
-        dotDrawable.setColor(0xFFFFFFFF); // white = silent
+        dotDrawable.setColor(0xFFFFFFFF);
         dotDrawable.setSize(sizePx, sizePx);
 
         overlayDot = new View(this);
@@ -374,7 +380,6 @@ public class VoiceService extends Service {
         windowManager.addView(overlayDot, params);
         overlayAdded = true;
 
-        // Poll speaking state every 100ms
         overlayHandler = new Handler(Looper.getMainLooper());
         overlayHandler.post(overlayUpdater);
     }
@@ -411,15 +416,9 @@ public class VoiceService extends Service {
         }
     }
 
-    /**
-     * Called when user swipes app from recents.
-     * Service keeps running — voice stays alive.
-     */
     @Override
     public void onTaskRemoved(Intent rootIntent) {
         super.onTaskRemoved(rootIntent);
-        // Do NOT stop — this is the whole point of background voice.
-        // The foreground notification keeps us alive.
         Log.d(TAG, "Task removed — voice continues in background");
     }
 
