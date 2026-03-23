@@ -8,6 +8,7 @@ import android.content.Intent;
 import android.content.ServiceConnection;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.util.Log;
 import android.widget.Button;
 import android.widget.ListView;
 import android.widget.TextView;
@@ -19,26 +20,32 @@ import androidx.appcompat.app.AppCompatActivity;
 
 import com.voxlink.R;
 import com.voxlink.audio.VoiceService;
+import com.voxlink.audio.WebRTCEngine;
 import com.voxlink.model.Room;
 import com.voxlink.network.SignalingClient;
 import com.voxlink.util.HashUtil;
 
+import org.json.JSONObject;
+
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 public class RoomActivity extends AppCompatActivity {
+
+    private static final String TAG = "VoxLink.Room";
 
     public static final String EXTRA_SERVER   = "server";
     public static final String EXTRA_ROOM_ID  = "room_id";
     public static final String EXTRA_PASSWORD = "password";
     public static final String EXTRA_USERNAME = "username";
-    public static final String EXTRA_IS_HOST  = "is_host";
 
     private String server;
     private String roomId;
     private String password;
     private String username;
-    private String resolvedUserId;
+    private String myUserId;
 
     private TextView tvRoomId;
     private TextView tvStatus;
@@ -50,35 +57,56 @@ public class RoomActivity extends AppCompatActivity {
 
     private MemberAdapter memberAdapter;
     private final List<Room.Member> members = new ArrayList<>();
+    private final Set<String> knownPeerIds = new HashSet<>();
 
     private VoiceService voiceService;
     private boolean serviceBound = false;
     private boolean isMuted = false;
 
     private SignalingClient signalingClient;
-    private String udpHost;
-    private String udpKey;
-    private String udpRoomId;
-    private String udpUserId;
-    private int udpPort = 45000;
-    private String signalingToken;
-    private String signalingBaseUrl;
 
     private final ServiceConnection serviceConn = new ServiceConnection() {
         @Override
         public void onServiceConnected(ComponentName n, IBinder b) {
             voiceService = ((VoiceService.VoiceBinder) b).getService();
             serviceBound = true;
-            // Sync mute state from service in case activity was recreated
             isMuted = voiceService.isMuted();
             btnMute.setText(isMuted ? "Muted" : "Mute");
             btnMute.setAlpha(isMuted ? 0.55f : 1.0f);
+
+            // Set up WebRTC signal callback
+            WebRTCEngine engine = voiceService.getWebRTCEngine();
+            if (engine != null) {
+                engine.setSignalCallback(signalCallback);
+                // Add peers for existing members
+                syncPeers();
+            }
         }
         @Override
         public void onServiceDisconnected(ComponentName n) {
-            // Only called on crash/unexpected disconnect, NOT on unbind
             serviceBound = false;
             voiceService = null;
+        }
+    };
+
+    private final WebRTCEngine.SignalCallback signalCallback = new WebRTCEngine.SignalCallback() {
+        @Override
+        public void sendOffer(String targetUserId, String sdp) {
+            if (signalingClient != null) {
+                signalingClient.postSignal(targetUserId, "offer", sdp);
+            }
+        }
+        @Override
+        public void sendAnswer(String targetUserId, String sdp) {
+            if (signalingClient != null) {
+                signalingClient.postSignal(targetUserId, "answer", sdp);
+            }
+        }
+        @Override
+        public void sendCandidate(String targetUserId, String candidateJson) {
+            if (signalingClient != null) {
+                signalingClient.postSignal(targetUserId, "candidate", candidateJson);
+            }
         }
     };
 
@@ -122,16 +150,8 @@ public class RoomActivity extends AppCompatActivity {
         signalingClient = new SignalingClient(server);
         signalingClient.setListener(new SignalingClient.SignalingListener() {
             @Override
-            public void onJoined(Room room, String uHost, int uPort, String uKey,
-                                 String uRoomId, String uUserId, String userId) {
-                udpHost   = uHost;
-                udpPort   = uPort;
-                udpKey    = uKey;
-                udpRoomId = uRoomId;
-                udpUserId = uUserId;
-                resolvedUserId = userId;
-                signalingToken   = signalingClient.getToken();
-                signalingBaseUrl = signalingClient.getBaseUrl();
+            public void onJoined(Room room, String resolvedUserId) {
+                myUserId = resolvedUserId;
                 tvStatus.setText("Connected");
                 updateMembers(room.members);
                 startVoiceService();
@@ -139,12 +159,18 @@ public class RoomActivity extends AppCompatActivity {
             @Override
             public void onMembersUpdated(List<Room.Member> updated) {
                 updateMembers(updated);
+                syncPeers();
             }
             @Override
             public void onMemberLeft(String uid) {
                 members.removeIf(m -> m.userId.equals(uid));
                 memberAdapter.notifyDataSetChanged();
                 tvMemberCount.setText(members.size() + " online");
+                removePeer(uid);
+            }
+            @Override
+            public void onSignalReceived(String fromUserId, String type, String payload) {
+                handleSignal(fromUserId, type, payload);
             }
             @Override
             public void onError(String msg) {
@@ -162,18 +188,78 @@ public class RoomActivity extends AppCompatActivity {
     private void startVoiceService() {
         Intent intent = new Intent(this, VoiceService.class);
         intent.setAction(VoiceService.ACTION_START);
-        intent.putExtra(VoiceService.EXTRA_ROOM_ID,      roomId);
-        intent.putExtra(VoiceService.EXTRA_USER_ID,      resolvedUserId);
-        intent.putExtra(VoiceService.EXTRA_USER_NAME,    username);
-        intent.putExtra(VoiceService.EXTRA_SERVER_HOST,  udpHost);
-        intent.putExtra(VoiceService.EXTRA_SERVER_PORT,  udpPort);
-        intent.putExtra(VoiceService.EXTRA_UDP_KEY,      udpKey);
-        intent.putExtra(VoiceService.EXTRA_UDP_ROOM_ID,  udpRoomId);
-        intent.putExtra(VoiceService.EXTRA_UDP_USER_ID,  udpUserId);
-        intent.putExtra(VoiceService.EXTRA_BASE_URL,     signalingBaseUrl);
-        intent.putExtra(VoiceService.EXTRA_TOKEN,        signalingToken);
+        intent.putExtra(VoiceService.EXTRA_ROOM_ID,   roomId);
+        intent.putExtra(VoiceService.EXTRA_USER_ID,   myUserId);
+        intent.putExtra(VoiceService.EXTRA_USER_NAME, username);
+        intent.putExtra(VoiceService.EXTRA_BASE_URL,  signalingClient.getBaseUrl());
+        intent.putExtra(VoiceService.EXTRA_TOKEN,     signalingClient.getToken());
         startForegroundService(intent);
         bindService(new Intent(this, VoiceService.class), serviceConn, Context.BIND_AUTO_CREATE);
+    }
+
+    private void syncPeers() {
+        if (!serviceBound || voiceService == null) return;
+        WebRTCEngine engine = voiceService.getWebRTCEngine();
+        if (engine == null || myUserId == null) return;
+
+        Set<String> currentIds = new HashSet<>();
+        for (Room.Member m : members) {
+            if (!m.userId.equals(myUserId)) {
+                currentIds.add(m.userId);
+            }
+        }
+
+        // Add new peers — we create offer if our userId is lexicographically greater
+        for (String id : currentIds) {
+            if (!knownPeerIds.contains(id)) {
+                boolean createOffer = myUserId.compareTo(id) > 0;
+                engine.addPeer(id, createOffer);
+                knownPeerIds.add(id);
+            }
+        }
+
+        // Remove departed peers
+        Set<String> departed = new HashSet<>(knownPeerIds);
+        departed.removeAll(currentIds);
+        for (String id : departed) {
+            engine.removePeer(id);
+            knownPeerIds.remove(id);
+        }
+    }
+
+    private void removePeer(String userId) {
+        if (serviceBound && voiceService != null) {
+            WebRTCEngine engine = voiceService.getWebRTCEngine();
+            if (engine != null) engine.removePeer(userId);
+        }
+        knownPeerIds.remove(userId);
+    }
+
+    private void handleSignal(String fromUserId, String type, String payload) {
+        if (!serviceBound || voiceService == null) return;
+        WebRTCEngine engine = voiceService.getWebRTCEngine();
+        if (engine == null) return;
+
+        try {
+            switch (type) {
+                case "offer":
+                    engine.handleOffer(fromUserId, payload);
+                    knownPeerIds.add(fromUserId);
+                    break;
+                case "answer":
+                    engine.handleAnswer(fromUserId, payload);
+                    break;
+                case "candidate":
+                    JSONObject c = new JSONObject(payload);
+                    engine.handleCandidate(fromUserId,
+                            c.getString("sdpMid"),
+                            c.getInt("sdpMLineIndex"),
+                            c.getString("candidate"));
+                    break;
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "handleSignal error: " + e.getMessage());
+        }
     }
 
     private void updateMembers(List<Room.Member> list) {
@@ -227,7 +313,6 @@ public class RoomActivity extends AppCompatActivity {
             unbindService(serviceConn);
             serviceBound = false;
         }
-        // Go back to MainActivity so user can join another room
         Intent main = new Intent(this, MainActivity.class);
         main.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
         startActivity(main);
@@ -238,7 +323,6 @@ public class RoomActivity extends AppCompatActivity {
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
             public void handleOnBackPressed() {
-                // Minimize instead of leaving — user switching to game
                 moveTaskToBack(true);
             }
         });
@@ -247,13 +331,10 @@ public class RoomActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        // Only unbind — do NOT stop service. Voice must keep running.
         if (serviceBound) {
             unbindService(serviceConn);
             serviceBound = false;
         }
-        // Stop signaling polling/heartbeat — service has its own heartbeat
-        // But do NOT call leave() — user is still in the room via VoiceService
         if (signalingClient != null) {
             signalingClient.stopPolling();
         }

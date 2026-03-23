@@ -50,22 +50,16 @@ public class VoiceService extends Service {
     public static final String EXTRA_ROOM_ID     = "room_id";
     public static final String EXTRA_USER_ID     = "user_id";
     public static final String EXTRA_USER_NAME   = "user_name";
-    public static final String EXTRA_SERVER_HOST = "server_host";
-    public static final String EXTRA_SERVER_PORT = "server_port";
-    public static final String EXTRA_UDP_KEY     = "udp_key";
-    public static final String EXTRA_UDP_ROOM_ID = "udp_room_id";
-    public static final String EXTRA_UDP_USER_ID = "udp_user_id";
     public static final String EXTRA_BASE_URL    = "base_url";
     public static final String EXTRA_TOKEN       = "token";
 
-    private AudioEngine                audioEngine;
+    private WebRTCEngine               webrtcEngine;
     private PowerManager.WakeLock      wakeLock;
     private WifiManager.WifiLock       wifiLock;
     private ScheduledExecutorService   heartbeatScheduler;
     private volatile boolean           isMuted     = false;
     private String                     currentRoom = "";
 
-    // Track consecutive heartbeat failures for connection monitoring
     private final AtomicInteger heartbeatFailCount = new AtomicInteger(0);
 
     // Floating overlay dot
@@ -94,19 +88,14 @@ public class VoiceService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent == null) {
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-            String roomId     = prefs.getString("room_id", null);
-            String serverHost = prefs.getString("server_host", null);
-            if (roomId != null && serverHost != null) {
+            String roomId  = prefs.getString("room_id", null);
+            String baseUrl = prefs.getString("base_url", null);
+            if (roomId != null && baseUrl != null) {
                 Log.d(TAG, "System restart — resuming voice for " + roomId);
                 startVoice(
                     roomId,
                     prefs.getString("user_id", null),
                     prefs.getString("user_name", null),
-                    serverHost,
-                    prefs.getInt("server_port", 45000),
-                    prefs.getString("udp_key", ""),
-                    prefs.getString("udp_room_id", ""),
-                    prefs.getString("udp_user_id", ""),
                     prefs.getString("base_url", null),
                     prefs.getString("token", null)
                 );
@@ -125,11 +114,6 @@ public class VoiceService extends Service {
                     intent.getStringExtra(EXTRA_ROOM_ID),
                     intent.getStringExtra(EXTRA_USER_ID),
                     intent.getStringExtra(EXTRA_USER_NAME),
-                    intent.getStringExtra(EXTRA_SERVER_HOST),
-                    intent.getIntExtra(EXTRA_SERVER_PORT, 45000),
-                    intent.getStringExtra(EXTRA_UDP_KEY),
-                    intent.getStringExtra(EXTRA_UDP_ROOM_ID),
-                    intent.getStringExtra(EXTRA_UDP_USER_ID),
                     intent.getStringExtra(EXTRA_BASE_URL),
                     intent.getStringExtra(EXTRA_TOKEN)
                 );
@@ -145,23 +129,16 @@ public class VoiceService extends Service {
     }
 
     private void startVoice(String roomId, String userId, String userName,
-                            String serverHost, int serverPort, String udpKey,
-                            String udpRoomId, String udpUserId,
                             String baseUrl, String token) {
-        if (roomId == null || serverHost == null) { stopSelf(); return; }
+        if (roomId == null) { stopSelf(); return; }
 
         // Persist for START_STICKY restart
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
-            .putString("room_id",      roomId)
-            .putString("user_id",      userId)
-            .putString("user_name",    userName)
-            .putString("server_host",  serverHost)
-            .putInt("server_port",     serverPort)
-            .putString("udp_key",      udpKey != null ? udpKey : "")
-            .putString("udp_room_id",  udpRoomId != null ? udpRoomId : "")
-            .putString("udp_user_id",  udpUserId != null ? udpUserId : "")
-            .putString("base_url",     baseUrl)
-            .putString("token",        token)
+            .putString("room_id",   roomId)
+            .putString("user_id",   userId)
+            .putString("user_name", userName)
+            .putString("base_url",  baseUrl)
+            .putString("token",     token)
             .apply();
 
         currentRoom = roomId;
@@ -183,57 +160,19 @@ public class VoiceService extends Service {
         }
         if (!wifiLock.isHeld()) wifiLock.acquire();
 
-        // Use the same userId from SignalingClient
-        if (userId == null || userId.isEmpty()) {
-            userId = userName + "_" + (System.currentTimeMillis() % 9999);
-            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
-                .putString("user_id", userId)
-                .apply();
+        // Init WebRTC engine
+        if (webrtcEngine != null) {
+            webrtcEngine.dispose();
+            webrtcEngine = null;
         }
-
-        // Stop existing engine before re-creating
-        if (audioEngine != null) {
-            audioEngine.stop();
-            audioEngine = null;
-        }
-
-        byte[] udpKeyBytes = hexToBytes(udpKey);
-        audioEngine = new AudioEngine(serverHost, serverPort,
-                udpUserId != null && !udpUserId.isEmpty() ? udpUserId : userId,
-                udpRoomId != null && !udpRoomId.isEmpty() ? udpRoomId : roomId,
-                udpKeyBytes);
-
-        if (!audioEngine.init()) {
-            Log.e(TAG, "Audio init failed");
-            releaseAll();
-            stopForeground(true);
-            stopSelf();
-            return;
-        }
-        audioEngine.start();
+        webrtcEngine = new WebRTCEngine();
+        webrtcEngine.init(getApplicationContext());
+        webrtcEngine.setMuted(isMuted);
 
         startServiceHeartbeat(baseUrl, roomId, userId, token);
         showOverlayDot();
 
-        Log.d(TAG, "Voice started for room " + roomId
-                + " udpRoom=" + udpRoomId + " udpUser=" + udpUserId);
-    }
-
-    private static byte[] hexToBytes(String hex) {
-        if (hex == null || hex.isEmpty() || hex.length() % 2 != 0) return new byte[4];
-        try {
-            int len = hex.length();
-            byte[] data = new byte[len / 2];
-            for (int i = 0; i < len; i += 2) {
-                int hi = Character.digit(hex.charAt(i), 16);
-                int lo = Character.digit(hex.charAt(i + 1), 16);
-                if (hi < 0 || lo < 0) return new byte[4];
-                data[i / 2] = (byte) ((hi << 4) + lo);
-            }
-            return data;
-        } catch (Exception e) {
-            return new byte[4];
-        }
+        Log.d(TAG, "Voice started for room " + roomId);
     }
 
     private void startServiceHeartbeat(String baseUrl, String roomId, String userId, String token) {
@@ -285,7 +224,7 @@ public class VoiceService extends Service {
 
     private void releaseAll() {
         removeOverlayDot();
-        if (audioEngine != null) { audioEngine.stop(); audioEngine = null; }
+        if (webrtcEngine != null) { webrtcEngine.dispose(); webrtcEngine = null; }
         if (heartbeatScheduler != null) { heartbeatScheduler.shutdownNow(); heartbeatScheduler = null; }
         if (wakeLock != null && wakeLock.isHeld()) { try { wakeLock.release(); } catch (Exception ignored) {} }
         if (wifiLock != null && wifiLock.isHeld()) { try { wifiLock.release(); } catch (Exception ignored) {} }
@@ -295,20 +234,22 @@ public class VoiceService extends Service {
 
     private void toggleMute() {
         isMuted = !isMuted;
-        if (audioEngine != null) audioEngine.setMuted(isMuted);
+        if (webrtcEngine != null) webrtcEngine.setMuted(isMuted);
         NotificationManager nm = getSystemService(NotificationManager.class);
         nm.notify(NOTIFICATION_ID, buildNotification(currentRoom, isMuted));
+        updateOverlayColor();
     }
 
     public void setMuted(boolean muted) {
         isMuted = muted;
-        if (audioEngine != null) audioEngine.setMuted(muted);
+        if (webrtcEngine != null) webrtcEngine.setMuted(muted);
         NotificationManager nm = getSystemService(NotificationManager.class);
         nm.notify(NOTIFICATION_ID, buildNotification(currentRoom, isMuted));
+        updateOverlayColor();
     }
 
     public boolean isMuted() { return isMuted; }
-    public AudioEngine getAudioEngine() { return audioEngine; }
+    public WebRTCEngine getWebRTCEngine() { return webrtcEngine; }
     public boolean isConnected() { return heartbeatFailCount.get() < 5; }
 
     private Notification buildNotification(String roomId, boolean muted) {
@@ -361,7 +302,7 @@ public class VoiceService extends Service {
 
         dotDrawable = new GradientDrawable();
         dotDrawable.setShape(GradientDrawable.OVAL);
-        dotDrawable.setColor(0xFFFFFFFF);
+        dotDrawable.setColor(isMuted ? 0xFFFFFFFF : 0xFF4ADE80);
         dotDrawable.setSize(sizePx, sizePx);
 
         overlayDot = new View(this);
@@ -379,26 +320,15 @@ public class VoiceService extends Service {
 
         windowManager.addView(overlayDot, params);
         overlayAdded = true;
-
-        overlayHandler = new Handler(Looper.getMainLooper());
-        overlayHandler.post(overlayUpdater);
     }
 
-    private final Runnable overlayUpdater = new Runnable() {
-        @Override
-        public void run() {
-            if (!overlayAdded || dotDrawable == null) return;
-            boolean isSpeaking = audioEngine != null && audioEngine.isSpeaking();
-            dotDrawable.setColor(isSpeaking ? 0xFF4ADE80 : 0xFFFFFFFF);
-            if (overlayHandler != null) overlayHandler.postDelayed(this, 100);
+    private void updateOverlayColor() {
+        if (overlayAdded && dotDrawable != null) {
+            dotDrawable.setColor(isMuted ? 0xFFFFFFFF : 0xFF4ADE80);
         }
-    };
+    }
 
     private void removeOverlayDot() {
-        if (overlayHandler != null) {
-            overlayHandler.removeCallbacks(overlayUpdater);
-            overlayHandler = null;
-        }
         if (overlayAdded && overlayDot != null && windowManager != null) {
             try { windowManager.removeView(overlayDot); } catch (Exception ignored) {}
             overlayAdded = false;

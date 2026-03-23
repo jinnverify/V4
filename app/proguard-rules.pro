@@ -18,6 +18,9 @@
 -keep class android.** { *; }
 -dontwarn android.**
 
+# WebRTC
+-keep class org.webrtc.** { *; }
+
 # Shrink aggressively
 -optimizations !code/simplification/arithmetic,!code/simplification/cast,!field/*,!class/merging/*
 -optimizationpasses 5
